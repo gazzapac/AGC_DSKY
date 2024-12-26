@@ -1,3 +1,11 @@
+Dec 26 12:09:13 raspberrypi systemd[1]: Starting runAGC.service - Run AGC Script...
+Dec 26 12:09:13 raspberrypi echo[1156]: Starting AGC Service
+Dec 26 12:09:13 raspberrypi echo[1160]: AGC Service Started
+Dec 26 12:09:13 raspberrypi runAGC.sh[1159]: Starting VirtualAGC
+Dec 26 12:09:13 raspberrypi systemd[1]: Started runAGC.service - Run AGC Script.
+Dec 26 12:09:13 raspberrypi runAGC.sh[1159]: Starting DSKY
+Dec 26 12:09:13 raspberrypi systemd[1]: runAGC.service: Deactivated successfully.
+
 Dec 26 09:12:05 raspberrypi systemd[1]: Started runAGC.service - Run AGC Script.
 Dec 26 09:12:05 raspberrypi runAGC.sh[5750]: Starting VirtualAGC
 Dec 26 09:12:05 raspberrypi runAGC.sh[5750]: Starting DSKY
