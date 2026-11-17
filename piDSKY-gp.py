@@ -538,7 +538,48 @@ def codeToString(code):
 # value is supposed to be a list of 3-tuples of the form
 #	[ (channel0,value0,mask0), (channel1,value1,mask1), ...]
 # and may be en empty list.  
+# Keypad shutdown: key V98E (a spare verb in Luminary099 - the AGC just lights
+# OPR ERR), then press PRO within SHUTDOWN_WINDOW seconds while all the lamps
+# blink.  Any other key, or the timeout, cancels.  The confirming PRO is not
+# sent to the AGC.
+SHUTDOWN_ARM_KEYS = ['V', '9', '8', 'E']
+SHUTDOWN_WINDOW = 5.0
+recentKeys = collections.deque(maxlen=len(SHUTDOWN_ARM_KEYS))
+shutdownArmedUntil = 0
+shutdownBlink = False
+
+def shutdownNow():
+    global shutdownArmedUntil, shutdownBlink
+    print("Shutdown confirmed from keypad; powering off")
+    shutdownArmedUntil = 0
+    shutdownBlink = False
+    for key in lampStatuses:
+        lampStatuses[key]["isLit"] = False
+    pixels.fill(black)
+    pixels.show()
+    nextion_vn_blink(0)
+    nextion_clearscreen()
+    subprocess.run(["systemctl", "poweroff"])
+
+def shutdownTick():
+    # Called every pass of the event loop: blink lamps while armed, handle timeout.
+    global shutdownArmedUntil, shutdownBlink
+    if shutdownArmedUntil == 0:
+        return
+    if time.time() > shutdownArmedUntil:
+        print("Keypad shutdown cancelled (timeout)")
+        shutdownArmedUntil = 0
+        shutdownBlink = False
+        updateLamps()
+        return
+    blink = int(time.time() * 4) % 2 == 0
+    if blink != shutdownBlink:
+        shutdownBlink = blink
+        updateLamps()
+
 def inputsForAGC():
+    global shutdownArmedUntil, shutdownBlink
+    shutdownTick()
     ch = get_char_keyboard_nonblock()
     #print(f'Key pressed      : {ch}')
     ch = ch.upper()
@@ -547,6 +588,20 @@ def inputsForAGC():
         ch = '-'
     elif ch == '=':
         ch = '+'
+    if ch != "" and ch != 'PR':
+        if shutdownArmedUntil != 0:
+            if ch == 'P':
+                shutdownNow()
+                return []
+            print("Keypad shutdown cancelled")
+            shutdownArmedUntil = 0
+            shutdownBlink = False
+            updateLamps()
+        recentKeys.append(ch)
+        if list(recentKeys) == SHUTDOWN_ARM_KEYS:
+            print("V98E: press PRO within %g s to shut down, any other key cancels" % SHUTDOWN_WINDOW)
+            recentKeys.clear()
+            shutdownArmedUntil = time.time() + SHUTDOWN_WINDOW
     returnValue = parseDskyKey(ch)
         #print(f'Key returnValue  : {returnValue}')
     if len(returnValue) > 0:
@@ -562,7 +617,7 @@ def updateLamps():
     # set the neopixels in the inicator panel dependant on the
     # lamp status values.  The strip is written once per call (auto_write is off).
     for key in lampStatuses:
-        if lampStatuses[key]["isLit"] or dskyTest:
+        if lampStatuses[key]["isLit"] or dskyTest or shutdownBlink:
             for x in lamps[key]["pos"]:
                 pixels[x] = lamps[key]["col"]
         else:
