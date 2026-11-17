@@ -82,6 +82,16 @@ cli.add_argument("--pico-glob", default="/dev/input/by-id/usb-Raspberry_Pi_Pico*
                  help="Glob used to find the Pico keypad input device.")
 args = cli.parse_args()
 
+# Only one copy may drive the Nextion/NeoPixels/keypad at a time; a second copy
+# (e.g. a leftover desktop autostart) would fight over the display.
+lockFile = open("/run/lock/piDSKY.lock", "w")
+try:
+    fcntl.flock(lockFile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    print("Another piDSKY-gp.py is already running; exiting. "
+          "(If it's the service: sudo systemctl stop dsky)")
+    sys.exit(1)
+
 # Reset the raspberry pi pico
 GPIO.setmode(GPIO.BCM)             
 GPIO.setup(23, GPIO.OUT) 	# set GPIO 23 to output  
