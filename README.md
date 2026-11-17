@@ -24,9 +24,8 @@ Expects Virtual AGC to be built in `~/virtualagc`. Close the VirtualAGC GUI,
 because it can take port 19797.
 
 ## Shutting down
-- **Keypad:** key `V98E` (a spare verb in Luminary099, so the AGC only lights
-  OPR ERR). All lamps blink for 5 s; press `PRO` to power off. Any other key,
-  or waiting, cancels. Press RSET to clear OPR ERR.
+- **Keypad:** key `V98E`. All lamps blink for 5 s; press `PRO` to power off.
+  Any other key, or waiting, cancels.
 - **Button:** GPIO17 (pin 11) to GND (`dtoverlay=gpio-shutdown,gpio_pin=17`).
 - **SSH:** `sudo poweroff`.
 
@@ -38,3 +37,7 @@ Unplug once the activity LED stays dark. To start again, cycle the power.
   misleading "Core-rope image file read error".
 - At idle the display shows a clock. The first keypress clears it and
   connects to the AGC.
+- `V94E`, or 10 minutes without a keypress (`--idle-minutes`), returns to the
+  clock. The AGC keeps running, and the next key restores its display.
+- `V94E` and `V98E` are handled on the Pi and never sent to the AGC. A VERB
+  press is therefore held until the next keys show it isn't one of them.

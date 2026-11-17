@@ -80,6 +80,9 @@ cli.add_argument("--keyboard", choices=["auto", "pico", "stdin"], default="auto"
                       "terminal; 'auto' (default) uses both when available.")
 cli.add_argument("--pico-glob", default="/dev/input/by-id/usb-Raspberry_Pi_Pico*-event-kbd",
                  help="Glob used to find the Pico keypad input device.")
+cli.add_argument("--idle-minutes", type=float, default=10,
+                 help="Return to the clock after this many minutes without a keypress "
+                      "(0 disables). V94E also returns to the clock.")
 args = cli.parse_args()
 
 # Only one copy may drive the Nextion/NeoPixels/keypad at a time; a second copy
@@ -472,7 +475,7 @@ def get_char_keyboard_nonblock():
     if c == "" and pressedPRO and time.time() > timePRO + 0.75:
         pressedPRO = False
         c = 'PR'
-    if c != "":
+    if c != "" and c != 'PR':
         keypressed = 1
     return c
 
@@ -538,15 +541,52 @@ def codeToString(code):
 # value is supposed to be a list of 3-tuples of the form
 #	[ (channel0,value0,mask0), (channel1,value1,mask1), ...]
 # and may be en empty list.  
-# Keypad shutdown: key V98E (a spare verb in Luminary099 - the AGC just lights
-# OPR ERR), then press PRO within SHUTDOWN_WINDOW seconds while all the lamps
-# blink.  Any other key, or the timeout, cancels.  The confirming PRO is not
-# sent to the AGC.
-SHUTDOWN_ARM_KEYS = ['V', '9', '8', 'E']
+# Local keypad commands.  These are caught here and never sent to the AGC:
+#   V98E  arm shutdown - all lamps blink; press PRO within SHUTDOWN_WINDOW
+#         seconds to power off.  Any other key, or the timeout, cancels.
+#   V94E  return to the idle clock (as does --idle-minutes without a keypress).
+# Sending them to the AGC would make it blank the display (it does that for
+# every extended verb) and light OPR ERR, so a V is held back until the
+# following keys show whether it starts one of these commands.  If not, the
+# held keys are passed on in order.
+LOCAL_COMMANDS = {"V98E": "shutdown", "V94E": "clock"}
+IDLE_TIMEOUT = args.idle_minutes * 60
+lastKeyTime = time.time()
 SHUTDOWN_WINDOW = 5.0
-recentKeys = collections.deque(maxlen=len(SHUTDOWN_ARM_KEYS))
+heldKeys = []
+# Keys waiting to go to yaAGC.  Only one is sent per pass of the event loop
+# (about 50 ms apart): two keystrokes arriving at once can lose the first.
+sendQueue = collections.deque()
 shutdownArmedUntil = 0
 shutdownBlink = False
+
+def isCommandPrefix(keys):
+    seq = "".join(keys)
+    return any(cmd.startswith(seq) for cmd in LOCAL_COMMANDS)
+
+def handleKey(ch):
+    # Hold, pass on, or act on one keypress.
+    global heldKeys, shutdownArmedUntil
+    candidate = "".join(heldKeys) + ch
+    if candidate in LOCAL_COMMANDS:
+        heldKeys = []
+        if LOCAL_COMMANDS[candidate] == "shutdown":
+            print("V98E: press PRO within %g s to shut down, any other key cancels" % SHUTDOWN_WINDOW)
+            shutdownArmedUntil = time.time() + SHUTDOWN_WINDOW
+        else:
+            enterClockMode("V94E")
+        return
+    if isCommandPrefix(heldKeys + [ch]):
+        heldKeys.append(ch)
+        return
+    # Not a local command: pass the held keys on, then deal with this key
+    # (which may itself start a new command, e.g. a second V).
+    sendQueue.extend(heldKeys)
+    heldKeys = []
+    if isCommandPrefix([ch]):
+        heldKeys = [ch]
+    else:
+        sendQueue.append(ch)
 
 def shutdownNow():
     global shutdownArmedUntil, shutdownBlink
@@ -578,17 +618,22 @@ def shutdownTick():
         updateLamps()
 
 def inputsForAGC():
-    global shutdownArmedUntil, shutdownBlink
+    global shutdownArmedUntil, shutdownBlink, lastKeyTime, heldKeys
     shutdownTick()
+    if IDLE_TIMEOUT > 0 and time.time() - lastKeyTime > IDLE_TIMEOUT:
+        enterClockMode("no keypress for %g min" % args.idle_minutes)
+        return []
     ch = get_char_keyboard_nonblock()
-    #print(f'Key pressed      : {ch}')
     ch = ch.upper()
-    #print(f'Key pressed upper: {ch}')
     if ch == '_':
         ch = '-'
     elif ch == '=':
         ch = '+'
-    if ch != "" and ch != 'PR':
+    if ch == 'PR':
+        # Synthetic PRO release; keep it in order behind any queued keys.
+        sendQueue.append(ch)
+    elif ch != "":
+        lastKeyTime = time.time()
         if shutdownArmedUntil != 0:
             if ch == 'P':
                 shutdownNow()
@@ -597,17 +642,45 @@ def inputsForAGC():
             shutdownArmedUntil = 0
             shutdownBlink = False
             updateLamps()
-        recentKeys.append(ch)
-        if list(recentKeys) == SHUTDOWN_ARM_KEYS:
-            print("V98E: press PRO within %g s to shut down, any other key cancels" % SHUTDOWN_WINDOW)
-            recentKeys.clear()
-            shutdownArmedUntil = time.time() + SHUTDOWN_WINDOW
-    returnValue = parseDskyKey(ch)
-        #print(f'Key returnValue  : {returnValue}')
+        handleKey(ch)
+    if idleclock != 2 or not sendQueue:
+        return []
+    returnValue = parseDskyKey(sendQueue.popleft())
     if len(returnValue) > 0:
             print(f'Sending to yaAGC non-Oct: {returnValue[0][1]} mask  {returnValue[0][2]} -> channel {returnValue[0][0]}')
             print("Sending to yaAGC     Oct: " + oct(returnValue[0][1]) + "(mask " + oct(returnValue[0][2]) + ") -> channel " + oct(returnValue[0][0]))
     return returnValue
+
+# Copy of what the AGC last put on the Nextion, so it can be redrawn after the
+# clock has been shown.  While the clock is showing (idleclock != 2), AGC
+# output is still read and recorded here but not drawn.
+agcShadow = {}
+
+def agcDisplayActive():
+    return idleclock == 2
+
+def agcNextion(field, value):
+    agcShadow[field] = value
+    if agcDisplayActive():
+        nextion(field, value)
+
+def agcCompActy(status):
+    agcShadow["_compacty"] = str(status)
+    if agcDisplayActive():
+        nextion_compacty(status)
+
+def agcVnBlink(status):
+    agcShadow["_vnblink"] = status
+    if agcDisplayActive():
+        nextion_vn_blink(status)
+
+def agcRedraw():
+    for field, value in agcShadow.items():
+        if not field.startswith("_"):
+            nextion(field, value)
+    nextion_compacty(agcShadow.get("_compacty", "0"))
+    nextion_vn_blink(agcShadow.get("_vnblink", 0))
+    updateLamps()
 
 # True while the AGC has the DSKY lamp-test bit (channel 13, bit 10) set, e.g.
 # during V35E.  All indicator lamps are lit while it is set.
@@ -617,7 +690,10 @@ def updateLamps():
     # set the neopixels in the inicator panel dependant on the
     # lamp status values.  The strip is written once per call (auto_write is off).
     for key in lampStatuses:
-        if lampStatuses[key]["isLit"] or dskyTest or shutdownBlink:
+        if not agcDisplayActive():
+            for x in lamps[key]["pos"]:
+                pixels[x] = black
+        elif lampStatuses[key]["isLit"] or dskyTest or shutdownBlink:
             for x in lamps[key]["pos"]:
                 pixels[x] = lamps[key]["col"]
         else:
@@ -668,19 +744,19 @@ def outputFromAGC(channel, value):
                 sd = codeToString(ddddd)
             if aaaa == 11:
                 print(sc + " -> M1   " + sd + " -> M2")
-                nextion("PROG1", sc)
-                nextion("PROG2", sd)
+                agcNextion("PROG1", sc)
+                agcNextion("PROG2", sd)
             elif aaaa == 10:
                 print(sc + " -> V1   " + sd + " -> V2")
-                nextion("VERB1", sc)
-                nextion("VERB2", sd)
+                agcNextion("VERB1", sc)
+                agcNextion("VERB2", sd)
             elif aaaa == 9:
                 print(sc + " -> N1   " + sd + " -> N2")
-                nextion("NOUN1", sc)
-                nextion("NOUN2", sd)
+                agcNextion("NOUN1", sc)
+                agcNextion("NOUN2", sd)
             elif aaaa == 8:
                 print("          " + sd + " -> 11")
-                nextion("R1_2", sd)
+                agcNextion("R1_2", sd)
             elif aaaa == 7:
                 plusMinus = "  "
                 if b != 0:
@@ -689,10 +765,10 @@ def outputFromAGC(channel, value):
                 else:
                     plusMinusState1 &= ~1
                 # 
-                nextion("R1_1", signChar(plusMinusState1))
+                agcNextion("R1_1", signChar(plusMinusState1))
                 print(sc + " -> 12   " + sd + " -> 13   " + plusMinus  + str(plusMinusState1))
-                nextion("R1_3", sc)
-                nextion("R1_4", sd)
+                agcNextion("R1_3", sc)
+                agcNextion("R1_4", sd)
             elif aaaa == 6:
                 plusMinus = "  "
                 if b != 0:
@@ -701,10 +777,10 @@ def outputFromAGC(channel, value):
                 else:
                     plusMinusState1 &= ~2
 
-                nextion("R1_1", signChar(plusMinusState1))
+                agcNextion("R1_1", signChar(plusMinusState1))
                 print(sc + " -> 14   " + sd + " -> 15   " + plusMinus + str(plusMinusState1))
-                nextion("R1_5", sc)
-                nextion("R1_6", sd)
+                agcNextion("R1_5", sc)
+                agcNextion("R1_6", sd)
             elif aaaa == 5:
                 plusMinus = "  "
                 if b != 0:
@@ -712,10 +788,10 @@ def outputFromAGC(channel, value):
                     plusMinusState2 |= 1
                 else:
                     plusMinusState2 &= ~1
-                nextion("R2_1", signChar(plusMinusState2))
+                agcNextion("R2_1", signChar(plusMinusState2))
                 print(sc + " -> 21   " + sd + " -> 22   " + plusMinus + str(plusMinusState2))
-                nextion("R2_2", sc)
-                nextion("R2_3", sd)
+                agcNextion("R2_2", sc)
+                agcNextion("R2_3", sd)
             elif aaaa == 4:
                 plusMinus = "  "
                 if b != 0:
@@ -723,14 +799,14 @@ def outputFromAGC(channel, value):
                     plusMinusState2 |= 2
                 else:
                     plusMinusState2 &= ~2
-                nextion("R2_1", signChar(plusMinusState2))
+                agcNextion("R2_1", signChar(plusMinusState2))
                 print(sc + " -> 23   " + sd + " -> 24   " + plusMinus + str(plusMinusState2))
-                nextion("R2_4", sc)
-                nextion("R2_5", sd)
+                agcNextion("R2_4", sc)
+                agcNextion("R2_5", sd)
             elif aaaa == 3:
                 print(sc + " -> 25   " + sd + " -> 31")
-                nextion("R2_6", sc)
-                nextion("R3_2", sd)
+                agcNextion("R2_6", sc)
+                agcNextion("R3_2", sd)
             elif aaaa == 2:
                 plusMinus = "  "
                 if b != 0:
@@ -738,23 +814,23 @@ def outputFromAGC(channel, value):
                     plusMinusState3 |= 1
                 else:
                     plusMinusState3 &= ~1
-                nextion("R3_1", signChar(plusMinusState3))
+                agcNextion("R3_1", signChar(plusMinusState3))
                 print(sc + " -> 32   " + sd + " -> 33   " + plusMinus + str(plusMinusState3))
-                nextion("R3_3", sc)
-                nextion("R3_4", sd)
+                agcNextion("R3_3", sc)
+                agcNextion("R3_4", sd)
             elif aaaa == 1:
                 plusMinus = "  "
                 if b != 0:
                     plusMinus = "3-"
                     plusMinusState3 |= 2
-                    #nextion("R3_1", "-")
+                    #agcNextion("R3_1", "-")
                 else:
                     plusMinusState3 &= ~2
-                    #nextion("R3_1", " ")
-                nextion("R3_1", signChar(plusMinusState3))
+                    #agcNextion("R3_1", " ")
+                agcNextion("R3_1", signChar(plusMinusState3))
                 print(sc + " -> 34   " + sd + " -> 35   " + plusMinus + str(plusMinusState3))
-                nextion("R3_5", sc)
-                nextion("R3_6", sd)
+                agcNextion("R3_5", sc)
+                agcNextion("R3_6", sd)
             elif aaaa == 12:
                 vel = "VEL OFF         "
                 if (value & 0x04) != 0:
@@ -804,9 +880,9 @@ def outputFromAGC(channel, value):
             compActy = "COMP ACTY OFF   "
             if (value & 0x02) != 0:
                 compActy = "COMP ACTY ON    "
-                nextion_compacty("1")
+                agcCompActy("1")
             else:
-                nextion_compacty("0")
+                agcCompActy("0")
                 
             uplinkActy = "UPLINK ACTY OFF "
             if (value & 0x04) != 0:
@@ -820,11 +896,11 @@ def outputFromAGC(channel, value):
                 if not vnFlashing:
                     vnFlashing = True
                     flashing = "V/N FLASH       "
-                    nextion_vn_blink(1)
+                    agcVnBlink(1)
             else:
                 if vnFlashing != False:
                     vnFlashing = False
-                    nextion_vn_blink(0)
+                    agcVnBlink(0)
 
             updateLamps()
         elif channel == 0o13:
@@ -945,8 +1021,26 @@ old_second = "00"
 old_millisecond = "0"
 old_millisecond2 = "0"
 
+def enterClockMode(reason):
+    global keypressed, idleclock, shutdownArmedUntil, shutdownBlink, heldKeys
+    global old_week, old_year, old_month, old_day, old_hour, old_minute, old_second
+    global old_millisecond, old_millisecond2
+    print("Returning to clock (" + reason + ")")
+    keypressed = 0
+    idleclock = 1
+    shutdownArmedUntil = 0
+    shutdownBlink = False
+    heldKeys = []
+    sendQueue.clear()
+    # Force the clock to repaint every field.
+    old_week = old_year = old_month = old_day = old_hour = old_minute = old_second = ""
+    old_millisecond = old_millisecond2 = ""
+    nextion_vn_blink(0)
+    nextion_clearscreen()
+    updateLamps()
+
 def clock():
-    global keypressed, idleclock, old_week, old_year, old_month, old_day, old_hour, old_minute, old_second, old_millisecond, old_millisecond2
+    global keypressed, idleclock, old_week, old_year, old_month, old_day, old_hour, old_minute, old_second, old_millisecond, old_millisecond2, lastKeyTime
     if keypressed == 0 and idleclock == 1:
 
         now = datetime.now() # current date and time
@@ -1012,6 +1106,10 @@ def clock():
         nextion_clearscreen()
         get_char_keyboard_nonblock()
         idleclock = 2
+        lastKeyTime = time.time()
+        if s is not None:
+            # Already connected (coming back from the clock): restore the AGC display.
+            agcRedraw()
 
 def gettemperature():
     global temp_minute, temp_minute_old
@@ -1069,100 +1167,119 @@ def check_ntp(args = '-c rv'):
 #             pixels[p_tracker] = black
 
 
-def eventLoop():
-    # Buffer for a packet received from yaAGC.
-    packetSize = 4
-    inputBuffer = bytearray(packetSize)
-    leftToRead = packetSize
+# Buffer for a packet received from yaAGC.
+packetSize = 4
+inputBuffer = bytearray(packetSize)
+leftToRead = packetSize
+view = memoryview(inputBuffer)
+
+def resetPacketBuffer():
+    global view, leftToRead
     view = memoryview(inputBuffer)
+    leftToRead = packetSize
+
+# Reads whatever yaAGC has sent and passes complete packets to outputFromAGC().
+# Returns True if anything was read.  If the connection is lost: with
+# reconnect=True, reconnects (blocking until yaAGC is back); otherwise just
+# drops the socket so the next wake from the clock reconnects.
+def pollAGC(reconnect=True):
+    global view, leftToRead, s, connectToAGCneeded
+    didSomething = False
+    while True:
+        # While these packets are always exactly 4 bytes long, since the socket
+        # is non-blocking, any individual read operation may yield less bytes
+        # than that, so the buffer may accumulate data over time until it fills.
+        try:
+            numNewBytes = s.recv_into(view, leftToRead)
+            if numNewBytes == 0:
+                raise ConnectionResetError("yaAGC closed the connection")
+        except (BlockingIOError, InterruptedError):
+            return didSomething
+        except OSError as e:
+            print("Lost connection to yaAGC: " + str(e))
+            resetPacketBuffer()
+            if reconnect:
+                connectToAGC()
+            else:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+                s = None
+                connectToAGCneeded = 0
+            return True
+        didSomething = True
+        view = view[numNewBytes:]
+        leftToRead -= numNewBytes
+        if leftToRead != 0:
+            continue
+        # Prepare for next read attempt.
+        resetPacketBuffer()
+        # Parse the packet just read, and call outputFromAGC().
+        # Start with a sanity check.
+        ok = 1
+        if (inputBuffer[0] & 0xF0) != 0x00:
+            ok = 0
+        elif (inputBuffer[1] & 0xC0) != 0x40:
+            ok = 0
+        elif (inputBuffer[2] & 0xC0) != 0x80:
+            ok = 0
+        elif (inputBuffer[3] & 0xC0) != 0xC0:
+            ok = 0
+        # Packet has the various signatures we expect.
+        if ok == 0:
+            # Note that, depending on the yaAGC version, it occasionally
+            # sends either a 1-byte packet (just 0xFF, older versions)
+            # or a 4-byte packet (0xFF 0xFF 0xFF 0xFF, newer versions)
+            # just for pinging the client.  These packets hold no
+            # data and need to be ignored, but for other corrupted packets
+            # we print a message. And try to realign past the corrupted
+            # bytes.
+            if inputBuffer[0] != 0xff or inputBuffer[1] != 0xff or inputBuffer[2] != 0xff or inputBuffer[3] != 0xff:
+                if inputBuffer[0] != 0xff:
+                    print("Illegal packet: " + hex(inputBuffer[0]) + " " + hex(inputBuffer[1]) + " " + hex(inputBuffer[2]) + " " + hex(inputBuffer[3]))
+                for i in range(1,packetSize):
+                    if (inputBuffer[i] & 0xF0) == 0:
+                        j = 0
+                        for k in range(i,4):
+                            inputBuffer[j] = inputBuffer[k]
+                            j += 1
+                        view = view[j:]
+                        leftToRead = packetSize - j
+                        break
+        else:
+            channel = (inputBuffer[0] & 0x0F) << 3
+            channel |= (inputBuffer[1] & 0x38) >> 3
+            value = (inputBuffer[1] & 0x07) << 12
+            value |= (inputBuffer[2] & 0x3F) << 6
+            value |= (inputBuffer[3] & 0x3F)
+            outputFromAGC(channel, value)
+
+def eventLoop():
     global keypressed, idleclock, connectToAGCneeded
     didSomething = False
     while True:
 
-        if keypressed == 0 and idleclock == 1:
-            #print (f'keypressed {keypressed} {type(keypressed)} idleclock {idleclock} {type(idleclock)}')
-            gettemperature()
-            check_ntp()
-            clock()
-        elif keypressed == 1 and idleclock == 1:
-            #print (f'keypressed {keypressed} {type(keypressed)} idleclock {idleclock} {type(idleclock)}')
+        if idleclock == 1:
+            # Showing the clock.  If we're already connected to yaAGC (i.e. we came
+            # back to the clock from the AGC), keep reading its output so the AGC
+            # display can be restored when a key is pressed.
+            if s is not None:
+                pollAGC(reconnect=False)
             gettemperature()
             check_ntp()
             clock()
         elif keypressed == 1 and idleclock == 2:
             # a key has been pressed, which means we want to play with the AGC.
             # we should connect to the AGC then
-            if connectToAGCneeded == 0:
+            if connectToAGCneeded == 0 or s is None:
                 connectToAGC()
                 connectToAGCneeded = 1
 
             if not didSomething:
                 time.sleep(PULSE)
-            didSomething = False
-            # Check for packet data received from yaAGC and process it.
-            # While these packets are always exactly 4
-            # bytes long, since the socket is non-blocking, any individual read
-            # operation may yield less bytes than that, so the buffer may accumulate data
-            # over time until it fills.	
-            try:
-                numNewBytes = s.recv_into(view, leftToRead)
-                if numNewBytes == 0:
-                    raise ConnectionResetError("yaAGC closed the connection")
-            except (BlockingIOError, InterruptedError):
-                numNewBytes = 0
-            except OSError as e:
-                print("Lost connection to yaAGC: " + str(e))
-                connectToAGC()
-                view = memoryview(inputBuffer)
-                leftToRead = packetSize
-                continue
-            if numNewBytes > 0:
-                view = view[numNewBytes:]
-                leftToRead -= numNewBytes
-                if leftToRead == 0:
-                    # Prepare for next read attempt.
-                    view = memoryview(inputBuffer)
-                    leftToRead = packetSize
-                    # Parse the packet just read, and call outputFromAGC().
-                    # Start with a sanity check.
-                    ok = 1
-                    if (inputBuffer[0] & 0xF0) != 0x00:
-                        ok = 0
-                    elif (inputBuffer[1] & 0xC0) != 0x40:
-                        ok = 0
-                    elif (inputBuffer[2] & 0xC0) != 0x80:
-                        ok = 0
-                    elif (inputBuffer[3] & 0xC0) != 0xC0:
-                        ok = 0
-                    # Packet has the various signatures we expect.
-                    if ok == 0:
-                        # Note that, depending on the yaAGC version, it occasionally
-                        # sends either a 1-byte packet (just 0xFF, older versions)
-                        # or a 4-byte packet (0xFF 0xFF 0xFF 0xFF, newer versions)
-                        # just for pinging the client.  These packets hold no
-                        # data and need to be ignored, but for other corrupted packets
-                        # we print a message. And try to realign past the corrupted
-                        # bytes.
-                        if inputBuffer[0] != 0xff or inputBuffer[1] != 0xff or inputBuffer[2] != 0xff or inputBuffer[2] != 0xff:
-                            if inputBuffer[0] != 0xff:
-                                print("Illegal packet: " + hex(inputBuffer[0]) + " " + hex(inputBuffer[1]) + " " + hex(inputBuffer[2]) + " " + hex(inputBuffer[3]))
-                            for i in range(1,packetSize):
-                                if (inputBuffer[i] & 0xF0) == 0:
-                                    j = 0
-                                    for k in range(i,4):
-                                        inputBuffer[j] = inputBuffer[k]
-                                        j += 1
-                                    view = view[j:]
-                                    leftToRead = packetSize - j
-                    else:
-                        channel = (inputBuffer[0] & 0x0F) << 3
-                        channel |= (inputBuffer[1] & 0x38) >> 3
-                        value = (inputBuffer[1] & 0x07) << 12
-                        value |= (inputBuffer[2] & 0x3F) << 6
-                        value |= (inputBuffer[3] & 0x3F)
-                        outputFromAGC(channel, value)
-                    didSomething = True
-            
+            didSomething = pollAGC()
+
             # Check for locally-generated data for which we must generate messages
             # to yaAGC over the socket.  In theory, the externalData list could contain
             # any number of channel operations, but in practice (at least for something
@@ -1172,16 +1289,16 @@ def eventLoop():
                 echoOn(True)
                 return
             for i in range(0, len(externalData)):
+                if s is None:
+                    break
                 try:
                     packetize(externalData[i])
                 except OSError as e:
                     print("Lost connection to yaAGC while sending: " + str(e))
                     connectToAGC()
-                    view = memoryview(inputBuffer)
-                    leftToRead = packetSize
+                    resetPacketBuffer()
                     break
                 didSomething = True
-                #print (f'keypressed {keypressed} {type(keypressed)} idleclock {idleclock} {type(idleclock)}')
 
 eventLoop()
 
