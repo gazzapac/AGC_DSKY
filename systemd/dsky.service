@@ -1,0 +1,17 @@
+[Unit]
+Description=piDSKY-gp DSKY front end (Nextion, NeoPixels, Pico 2 keypad)
+Wants=yaagc.service
+After=yaagc.service
+
+[Service]
+Type=simple
+# Root is required for the NeoPixels (rpi_ws281x) and GPIO.
+User=root
+ExecStart=/usr/bin/python3 /home/gazzapac-dsky/piDSKY-gp.py --keyboard=pico
+Environment=PYTHONUNBUFFERED=1
+StandardInput=null
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

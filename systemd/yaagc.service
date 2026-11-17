@@ -1,0 +1,19 @@
+[Unit]
+Description=yaAGC Apollo Guidance Computer emulator (Luminary099, LM)
+After=network.target
+
+[Service]
+Type=simple
+User=gazzapac-dsky
+# Run from a tmpfs directory: yaAGC writes a "core" resume file there every 10 s.
+# Keeping it in RAM avoids SD-card wear and stale/truncated resume files
+# (a truncated one causes "Core-rope image file read error").
+RuntimeDirectory=yaagc
+WorkingDirectory=/run/yaagc
+ExecStart=/home/gazzapac-dsky/virtualagc/yaAGC/yaAGC --no-resume --port=19797 --core=/home/gazzapac-dsky/virtualagc/Luminary099/Luminary099.bin
+StandardInput=null
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

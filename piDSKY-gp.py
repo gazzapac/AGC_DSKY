@@ -53,7 +53,13 @@ import termios
 import fcntl
 import socket
 import select
+import glob
+import collections
 import serial
+try:
+    import evdev
+except ImportError:
+    evdev = None
 from time import sleep, strftime
 from datetime import datetime
 import board
@@ -68,6 +74,12 @@ cli = argparse.ArgumentParser()
 cli.add_argument("--host", help="Host address of yaAGC, defaulting to localhost.")
 cli.add_argument("--port", help="Port for yaAGC, defaulting to 19797.", type=int)
 cli.add_argument("--slow", help="For use on really slow host systems.")
+cli.add_argument("--keyboard", choices=["auto", "pico", "stdin"], default="auto",
+                 help="Key source: 'pico' reads the Pico 2 keypad directly via /dev/input (works "
+                      "without a terminal, e.g. under systemd); 'stdin' reads the controlling "
+                      "terminal; 'auto' (default) uses both when available.")
+cli.add_argument("--pico-glob", default="/dev/input/by-id/usb-Raspberry_Pi_Pico*-event-kbd",
+                 help="Glob used to find the Pico keypad input device.")
 args = cli.parse_args()
 
 # Reset the raspberry pi pico
@@ -139,172 +151,61 @@ num_pixels = 28
 ORDER = neopixel.GRB
 
 pixels = neopixel.NeoPixel(
-    pixel_pin, num_pixels, brightness=0.8, auto_write=True, pixel_order=ORDER
+    pixel_pin, num_pixels, brightness=0.8, auto_write=False, pixel_order=ORDER
 )
 
-# define serial comms to Nextion - port may need changing if different on your Pi
-ser = serial.Serial( port='/dev/ttyS0',baudrate = 9600,timeout=0.1)
-ser.close()
-k=struct.pack('B', 0xff)
-eof = "\xff\xff\xff"
-nextion_sleep = 0.05
+# define serial comms to Nextion - port may need changing if different on your Pi.
+# The port is opened once and kept open (opening/closing it for every write was slow).
+ser = serial.Serial(port='/dev/ttyS0', baudrate=9600, timeout=0.1, write_timeout=2)
+NEXTION_EOF = b'\xff\xff\xff'
+
+# Last value sent to each Nextion object, so that repeated identical updates from
+# the AGC (which are very common) don't cost serial bandwidth.
+nextionCache = {}
+
+def nextion_send(cmd, cacheKey=None, cacheValue=None):
+    if cacheKey is not None:
+        if nextionCache.get(cacheKey) == cacheValue:
+            return
+        nextionCache[cacheKey] = cacheValue
+    ser.write(cmd.encode() + NEXTION_EOF)
 
 # subroutine to send something to nextion
 def nextion(command, arg):
-        progstring = ''
-        progstring = command+'.txt="'+arg+'"'
-        #k = struct.pack('B', progstring)
-        #print("command string: ",command,  progstring)
-        ser.open()
-        ser.write(progstring.encode())
-        ser.write(b'\xff\xff\xff')
-        ser.close()
+    nextion_send(command + '.txt="' + arg + '"', command, arg)
 
 #  subroutine to dim the nextion
 def nextion_dim(arg):
-        progstring = ''
-        progstring = 'dim='+str(arg)
-        #k = struct.pack('B', progstring)
-        #print("command string: ",command,  progstring)
-        ser.open()
-        ser.write(progstring.encode())
-        ser.write(b'\xff\xff\xff')
-        ser.close()
+    nextion_send('dim=' + str(arg))
 
 # subroutine to update the 'comp acty' light on nextion
 def nextion_compacty(status):
-        if status == "0":
-                ser.open()
-                ser.write(b"comp_acty.pic=2")
-                ser.write(b'\xff\xff\xff')
-                ser.close()
-        elif status == "1":
-                ser.open()
-                ser.write(b"comp_acty.pic=3")
-                ser.write(b'\xff\xff\xff')
-                ser.close()
+    if str(status) == "0":
+        nextion_send("comp_acty.pic=2", "comp_acty", 0)
+    elif str(status) == "1":
+        nextion_send("comp_acty.pic=3", "comp_acty", 1)
 
-# subroutine to blink the verb / noun digits 
+# subroutine to blink the verb / noun digits
 def nextion_vn_blink(status):
-        if status == 0:
-                ser.open()
-                ser.write(b"vn_blink_true.val=0")
-                ser.write(b'\xff\xff\xff')
-                ser.close()
-        elif status == 1:
-                ser.open()
-                ser.write(b"vn_blink_true.val=1")
-                ser.write(b'\xff\xff\xff')
-                ser.close()
+    if status in (0, 1):
+        nextion_send("vn_blink_true.val=" + str(status), "vn_blink", status)
+
+DIGIT_FIELDS = ["VERB1", "VERB2", "NOUN1", "NOUN2", "PROG1", "PROG2"]
+SIGN_FIELDS = ["R1_1", "R2_1", "R3_1"]
+REGISTER_FIELDS = ["R%d_%d" % (r, d) for r in (1, 2, 3) for d in range(1, 7)]
 
 #  subroutine to clear down the nextion
 def nextion_clearscreen():
     nextion_compacty(0)
-    sleep(nextion_sleep)
-    nextion("VERB1", " ")
-    sleep(nextion_sleep)
-    nextion("VERB2", " ")
-    sleep(nextion_sleep)
-    nextion("NOUN1", " ")
-    sleep(nextion_sleep)
-    nextion("NOUN2", " ")
-    sleep(nextion_sleep)
-    nextion("PROG1", " ")
-    sleep(nextion_sleep)
-    nextion("PROG2", " ")
-    sleep(nextion_sleep)
-    nextion("R1_1", " ")
-    sleep(nextion_sleep)
-    nextion("R1_2", " ")
-    sleep(nextion_sleep)
-    nextion("R1_3", " ")
-    sleep(nextion_sleep)
-    nextion("R1_4", " ")
-    sleep(nextion_sleep)
-    nextion("R1_5", " ")
-    sleep(nextion_sleep)
-    nextion("R1_6", " ")
-    sleep(nextion_sleep)
-    
-    nextion("R2_1", " ")
-    sleep(nextion_sleep)
-    nextion("R2_2", " ")
-    sleep(nextion_sleep)
-    nextion("R2_3", " ")
-    sleep(nextion_sleep)
-    nextion("R2_4", " ")
-    sleep(nextion_sleep)
-    nextion("R2_5", " ")
-    sleep(nextion_sleep)
-    nextion("R2_6", " ")
-    sleep(nextion_sleep)
-    
-    nextion("R3_1", " ")
-    sleep(nextion_sleep)
-    nextion("R3_2", " ")
-    sleep(nextion_sleep)
-    nextion("R3_3", " ")
-    sleep(nextion_sleep)
-    nextion("R3_4", " ")
-    sleep(nextion_sleep)
-    nextion("R3_5", " ")
-    sleep(nextion_sleep)
-    nextion("R3_6", " ")
-    sleep(nextion_sleep)
+    for f in DIGIT_FIELDS + REGISTER_FIELDS:
+        nextion(f, " ")
+    ser.flush()
 
 # subroutine to test nextion (light up all digits / lights)
 def nextion_testscreen():
-    sleep(nextion_sleep)
-    nextion("VERB1", "8")
-    sleep(nextion_sleep)
-    nextion("VERB2", "8")
-    sleep(nextion_sleep)
-    nextion("NOUN1", "8")
-    sleep(nextion_sleep)
-    nextion("NOUN2", "8")
-    sleep(nextion_sleep)
-    nextion("PROG1", "8")
-    sleep(nextion_sleep)
-    nextion("PROG2", "8")
-    sleep(nextion_sleep)
-    nextion("R1_1", "+")
-    sleep(nextion_sleep)
-    nextion("R1_2", "8")
-    sleep(nextion_sleep)
-    nextion("R1_3", "8")
-    sleep(nextion_sleep)
-    nextion("R1_4", "8")
-    sleep(nextion_sleep)
-    nextion("R1_5", "8")
-    sleep(nextion_sleep)
-    nextion("R1_6", "8")
-    sleep(nextion_sleep)
-    
-    nextion("R2_1", "+")
-    sleep(nextion_sleep)
-    nextion("R2_2", "8")
-    sleep(nextion_sleep)
-    nextion("R2_3", "8")
-    sleep(nextion_sleep)
-    nextion("R2_4", "8")
-    sleep(nextion_sleep)
-    nextion("R2_5", "8")
-    sleep(nextion_sleep)
-    nextion("R2_6", "8")
-    sleep(nextion_sleep)
-    
-    nextion("R3_1", "+")
-    sleep(nextion_sleep)
-    nextion("R3_2", "8")
-    sleep(nextion_sleep)
-    nextion("R3_3", "8")
-    sleep(nextion_sleep)
-    nextion("R3_4", "8")
-    sleep(nextion_sleep)
-    nextion("R3_5", "8")
-    sleep(nextion_sleep)
-    nextion("R3_6", "8")
-    sleep(nextion_sleep)
+    for f in DIGIT_FIELDS + REGISTER_FIELDS:
+        nextion(f, "+" if f in SIGN_FIELDS else "8")
+    ser.flush()
 
 print("Display will be dimmned")
 nextion_dim(20)
@@ -369,13 +270,13 @@ def packetize(tuple):
     outputBuffer[1] = 0x40 | ((tuple[0] << 3) & 0x38) | ((tuple[2] >> 12) & 0x07)
     outputBuffer[2] = 0x80 | ((tuple[2] >> 6) & 0x3F)
     outputBuffer[3] = 0xC0 | (tuple[2] & 0x3F)
-    s.send(outputBuffer)
+    s.sendall(outputBuffer)
     # Now, the actual data for the channel.
     outputBuffer[0] = 0x00 | ((tuple[0] >> 3) & 0x0F)
     outputBuffer[1] = 0x40 | ((tuple[0] << 3) & 0x38) | ((tuple[1] >> 12) & 0x07)
     outputBuffer[2] = 0x80 | ((tuple[1] >> 6) & 0x3F)
     outputBuffer[3] = 0xC0 | (tuple[1] & 0x3F)
-    s.send(outputBuffer)
+    s.sendall(outputBuffer)
 
 # This particular function parses various keystrokes, like '0' or 'V' and creates
 # packets as if they were DSKY keypresses.  It should be called occasionally as
@@ -391,16 +292,9 @@ def packetize(tuple):
 # would indicate that the lowest 5 bits of channel 15 (octal) were valid, and that
 # the value of those bits were 11001 (binary), which collectively indicate that
 # the KEY REL key on a DSKY is pressed.
-resetCount = 0
+# (The original "press RSET 5 times to exit" behaviour has been removed: on a
+# standalone DSKY it just killed the program when RSET was pressed repeatedly.)
 def parseDskyKey(ch):
-    global resetCount
-    if ch == 'R':
-        resetCount += 1
-        if resetCount >= 5:
-            print("Exiting ...")
-            return ""
-    elif ch != "":
-        resetCount = 0
     returnValue = []
     if ch == '0':
         returnValue.append( (0o15, 0o20, 0o37) )
@@ -444,8 +338,21 @@ def parseDskyKey(ch):
         returnValue.append( (0o15, 0o34, 0o37) )
     return returnValue	
 
+# Keyboard input.  Keys can come from two places:
+#  * the Pico 2 keypad, read directly from its /dev/input event device with evdev
+#    (no terminal or window focus needed, so this works under systemd), and
+#  * the controlling terminal's stdin (handy for bench testing over SSH).
+stdinIsTty = sys.stdin is not None and sys.stdin.isatty()
+useStdin = args.keyboard in ("auto", "stdin") and stdinIsTty
+usePico = args.keyboard in ("auto", "pico")
+if usePico and evdev is None:
+    print("python3-evdev is not installed; cannot read the Pico keypad directly")
+    usePico = False
+
 # This function turns keyboard echo on or off.
 def echoOn(control):
+    if not stdinIsTty:
+        return
     fd = sys.stdin.fileno()
     new = termios.tcgetattr(fd)
     if control:
@@ -460,16 +367,67 @@ echoOn(False)
 pressedPRO = False
 timePRO = 0
 
-# This function is a non-blocking read of a single character from the
-# keyboard.  Returns either the key value (such as '0' or 'V'), or else
-# the value "" if no key was pressed.  Note:  fakes a "key" 
-# 'PR' 0.75 seconds after a key 'p' or 'P'.  This is in lieu of PRO
-# press and release events.  Is is possible to get keypress and release
-# events or other equivalent data from the Python "keyboard" module, but
-# I didn't know about it at first, and am too lazy to go back and add
-# that support.
-def get_char_keyboard_nonblock():
-    global pressedPRO, timePRO, keypressed
+# Map of Linux key codes (as sent by the Pico's CircuitPython keymap, or any USB
+# keyboard) to the characters used by parseDskyKey().
+PICO_KEYMAP = {}
+if evdev is not None:
+    ec = evdev.ecodes
+    for d in range(10):
+        PICO_KEYMAP[getattr(ec, "KEY_%d" % d)] = str(d)
+        PICO_KEYMAP[getattr(ec, "KEY_KP%d" % d)] = str(d)
+    for letter in "VNCEPRK":
+        PICO_KEYMAP[getattr(ec, "KEY_" + letter)] = letter
+    PICO_KEYMAP.update({
+        ec.KEY_KPPLUS: '+', ec.KEY_EQUAL: '+',
+        ec.KEY_KPMINUS: '-', ec.KEY_MINUS: '-',
+        ec.KEY_ENTER: 'E', ec.KEY_KPENTER: 'E',
+    })
+
+picoDevice = None
+picoNextScan = 0
+keyQueue = collections.deque()
+
+def pollPico():
+    # Open the Pico keypad if necessary (it disappears for a moment when it is
+    # reset via GPIO 23 at startup, or if it is unplugged), then queue any keys.
+    global picoDevice, picoNextScan
+    if picoDevice is None:
+        if time.time() < picoNextScan:
+            return
+        picoNextScan = time.time() + 2
+        paths = sorted(glob.glob(args.pico_glob))
+        if not paths:
+            return
+        try:
+            picoDevice = evdev.InputDevice(paths[0])
+            try:
+                # Exclusive access, so keypresses don't also go to the desktop/console.
+                picoDevice.grab()
+            except OSError:
+                pass
+            print("Reading keypad from " + paths[0] + " (" + picoDevice.name + ")")
+        except OSError as e:
+            print("Could not open keypad " + paths[0] + ": " + str(e))
+            picoDevice = None
+            return
+    try:
+        while True:
+            event = picoDevice.read_one()
+            if event is None:
+                break
+            if event.type == evdev.ecodes.EV_KEY and event.value == 1:
+                ch = PICO_KEYMAP.get(event.code)
+                if ch is not None:
+                    keyQueue.append(ch)
+    except OSError as e:
+        print("Lost keypad device: " + str(e))
+        try:
+            picoDevice.close()
+        except Exception:
+            pass
+        picoDevice = None
+
+def readStdinChar():
     fd = sys.stdin.fileno()
     oldterm = termios.tcgetattr(fd)
     newattr = termios.tcgetattr(fd)
@@ -479,10 +437,25 @@ def get_char_keyboard_nonblock():
     fcntl.fcntl(fd, fcntl.F_SETFL, oldflags | os.O_NONBLOCK)
     c = ""
     try:
-            c = sys.stdin.read(1)
+            c = sys.stdin.read(1) or ""
     except IOError: pass
     termios.tcsetattr(fd, termios.TCSAFLUSH, oldterm)
     fcntl.fcntl(fd, fcntl.F_SETFL, oldflags)
+    return c
+
+# This function is a non-blocking read of a single key.  Returns either the
+# key value (such as '0' or 'V'), or else the value "" if no key was pressed.
+# Note:  fakes a "key" 'PR' 0.75 seconds after a key 'p' or 'P'.  This is in
+# lieu of PRO press and release events (the Pico sends press+release at once).
+def get_char_keyboard_nonblock():
+    global pressedPRO, timePRO, keypressed
+    if usePico:
+        pollPico()
+    c = ""
+    if keyQueue:
+        c = keyQueue.popleft()
+    elif useStdin:
+        c = readStdinChar()
     if c == 'p' or c == 'P':
         pressedPRO = True
         timePRO = time.time()
@@ -564,25 +537,28 @@ def inputsForAGC():
         ch = '-'
     elif ch == '=':
         ch = '+'
-    else:
-        returnValue = parseDskyKey(ch)
+    returnValue = parseDskyKey(ch)
         #print(f'Key returnValue  : {returnValue}')
     if len(returnValue) > 0:
             print(f'Sending to yaAGC non-Oct: {returnValue[0][1]} mask  {returnValue[0][2]} -> channel {returnValue[0][0]}')
             print("Sending to yaAGC     Oct: " + oct(returnValue[0][1]) + "(mask " + oct(returnValue[0][2]) + ") -> channel " + oct(returnValue[0][0]))
     return returnValue
 
+# True while the AGC has the DSKY lamp-test bit (channel 13, bit 10) set, e.g.
+# during V35E.  All indicator lamps are lit while it is set.
+dskyTest = False
+
 def updateLamps():
     # set the neopixels in the inicator panel dependant on the
-    # lamp status values 
-    
+    # lamp status values.  The strip is written once per call (auto_write is off).
     for key in lampStatuses:
-        if lampStatuses[key]["isLit"]:
+        if lampStatuses[key]["isLit"] or dskyTest:
             for x in lamps[key]["pos"]:
                 pixels[x] = lamps[key]["col"]
         else:
             for x in lamps[key]["pos"]:
                 pixels[x] = black
+    pixels.show()
     return
 
 updateLamps()
@@ -601,11 +577,18 @@ plusMinusState3 = 0
 # generic portion of the program. As a test, I simply display the outputs for 
 # those channels relevant to the DSKY.
 
+def signChar(state):
+    if state == 1:
+        return "+"
+    if state == 2:
+        return "-"
+    return " "
+
 def outputFromAGC(channel, value):
     # These lastNN values are just used to cut down on the number of messages printed,
     # when the same value is output over and over again to the same channel, because
     # that makes debugging harder.  
-    global last10, last11, last13, last163, plusMinusState1, plusMinusState2, plusMinusState3, vnFlashing
+    global last10, last11, last13, last163, plusMinusState1, plusMinusState2, plusMinusState3, vnFlashing, dskyTest
     if (channel == 0o13):
         value &= 0o3000
     if (channel == 0o10 and value != last10) or (channel == 0o11 and value != last11) or (channel == 0o13 and value != last13) or (channel == 0o163 and value != last163):
@@ -641,12 +624,7 @@ def outputFromAGC(channel, value):
                 else:
                     plusMinusState1 &= ~1
                 # 
-                if ((plusMinusState1 == 0) and (plusMinus == "1+")):
-                    nextion("R1_1", " ")
-                elif ((plusMinusState1 == 0) and (plusMinus == "  ")):
-                    nextion("R1_1", " ")	
-                elif (plusMinusState1 == 1 and plusMinus == "1+"):
-                    nextion("R1_1", "+")
+                nextion("R1_1", signChar(plusMinusState1))
                 print(sc + " -> 12   " + sd + " -> 13   " + plusMinus  + str(plusMinusState1))
                 nextion("R1_3", sc)
                 nextion("R1_4", sd)
@@ -658,12 +636,7 @@ def outputFromAGC(channel, value):
                 else:
                     plusMinusState1 &= ~2
 
-                if ((plusMinusState1 == 0) and (plusMinus == "1-")):
-                    nextion("R1_1", " ")
-                elif ((plusMinusState1 == 0) and (plusMinus == "  ")):
-                    nextion("R1_1", " ")
-                elif (plusMinusState1 == 1 and plusMinus == "1-"):
-                    nextion("R1_1", "-")
+                nextion("R1_1", signChar(plusMinusState1))
                 print(sc + " -> 14   " + sd + " -> 15   " + plusMinus + str(plusMinusState1))
                 nextion("R1_5", sc)
                 nextion("R1_6", sd)
@@ -674,12 +647,7 @@ def outputFromAGC(channel, value):
                     plusMinusState2 |= 1
                 else:
                     plusMinusState2 &= ~1
-                if ((plusMinusState2 == 0) and (plusMinus == "2+")):
-                    nextion("R2_1", " ")
-                elif ((plusMinusState2 == 0) and (plusMinus == "  ")):
-                    nextion("R2_1", " ")
-                elif (plusMinusState2 == 1 and plusMinus == "2+"):
-                    nextion("R2_1", "+")
+                nextion("R2_1", signChar(plusMinusState2))
                 print(sc + " -> 21   " + sd + " -> 22   " + plusMinus + str(plusMinusState2))
                 nextion("R2_2", sc)
                 nextion("R2_3", sd)
@@ -690,12 +658,7 @@ def outputFromAGC(channel, value):
                     plusMinusState2 |= 2
                 else:
                     plusMinusState2 &= ~2
-                if ((plusMinusState2 == 0) and (plusMinus == "2-")):
-                    nextion("R2_1", " ")
-                elif ((plusMinusState2 == 0) and (plusMinus == " ")):
-                    nextion("R2_1", " ")
-                elif (plusMinusState2 == 1 and plusMinus == "2-"):
-                    nextion("R2_1", "-")
+                nextion("R2_1", signChar(plusMinusState2))
                 print(sc + " -> 23   " + sd + " -> 24   " + plusMinus + str(plusMinusState2))
                 nextion("R2_4", sc)
                 nextion("R2_5", sd)
@@ -710,12 +673,7 @@ def outputFromAGC(channel, value):
                     plusMinusState3 |= 1
                 else:
                     plusMinusState3 &= ~1
-                if (plusMinusState3 == 0 and plusMinus == "3+"):
-                    nextion("R3_1", " ")
-                elif (plusMinusState3 == 0 and plusMinus == "  "):
-                    nextion("R3_1", " ")
-                elif (plusMinusState3 == 1 and plusMinus == "3+"):
-                    nextion("R3_1", "+")	
+                nextion("R3_1", signChar(plusMinusState3))
                 print(sc + " -> 32   " + sd + " -> 33   " + plusMinus + str(plusMinusState3))
                 nextion("R3_3", sc)
                 nextion("R3_4", sd)
@@ -728,12 +686,7 @@ def outputFromAGC(channel, value):
                 else:
                     plusMinusState3 &= ~2
                     #nextion("R3_1", " ")
-                if (plusMinusState3 == 0 and plusMinus == "3-"):
-                    nextion("R3_1", " ")
-                elif (plusMinusState3 == 0 and plusMinus == "  "):
-                    nextion("R3_1", " ")
-                elif (plusMinusState3 == 1 and plusMinus == "3-"):
-                    nextion("R3_1", "-")	
+                nextion("R3_1", signChar(plusMinusState3))
                 print(sc + " -> 34   " + sd + " -> 35   " + plusMinus + str(plusMinusState3))
                 nextion("R3_5", sc)
                 nextion("R3_6", sd)
@@ -784,10 +737,11 @@ def outputFromAGC(channel, value):
         elif channel == 0o11:
             last11 = value
             compActy = "COMP ACTY OFF   "
-            nextion_compacty("0")
             if (value & 0x02) != 0:
                 compActy = "COMP ACTY ON    "
                 nextion_compacty("1")
+            else:
+                nextion_compacty("0")
                 
             uplinkActy = "UPLINK ACTY OFF "
             if (value & 0x04) != 0:
@@ -811,7 +765,8 @@ def outputFromAGC(channel, value):
         elif channel == 0o13:
             last13 = value
             test = "DSKY TEST       "
-            if (value & 0x200) == 0:
+            dskyTest = (value & 0x200) != 0
+            if not dskyTest:
                 test = "DSKY NO TEST    "
             print(test)
             updateLamps()
@@ -851,6 +806,7 @@ def outputFromAGC(channel, value):
             else:
                 restart = "RESTART OFF     "
                 updateLampStatuses("RESTART", False)
+            updateLamps()
 
         else:
             print("Received from yaAGC: " + oct(value) + " -> channel " + oct(channel))
@@ -860,25 +816,51 @@ def outputFromAGC(channel, value):
 # Generic initialization (TCP socket setup).  Has no target-specific code, and 
 # shouldn't need to be modified unless there are bugs.
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setblocking(0)
+s = None
 
+def resetDisplayState():
+    # Forget everything we think we know about the AGC's outputs, so that the
+    # next values it sends are always written to the display.
+    global last10, last11, last13, last163, plusMinusState1, plusMinusState2, plusMinusState3
+    global vnFlashing, dskyTest
+    last10 = last11 = last13 = last163 = 1234567
+    plusMinusState1 = plusMinusState2 = plusMinusState3 = 0
+    vnFlashing = False
+    dskyTest = False
+
+# Connects to yaAGC, retrying until it succeeds.  A brand-new socket is created for
+# every attempt: a socket whose connect() has failed cannot be reused, which is why
+# the old version never recovered once yaAGC wasn't there at the first attempt.
 def connectToAGC():
-    while True:
+    global s
+    if s is not None:
         try:
-            s.connect((TCP_IP, TCP_PORT))
-            print("Connected to yaAGC (" + TCP_IP + ":" + str(TCP_PORT) + ")")
-            break
-        except socket.error as msg:
-            print("Could not connect to yaAGC (" + TCP_IP + ":" + str(TCP_PORT) + "), exiting: " + str(msg))
-            time.sleep(1)
-            # The following provides a clean exit from the program by simply 
-            # hitting any key.  However if get_char_keyboard_nonblock isn't
-            # defined, just delete the next 4 lines and use Ctrl-C to exit instead.
-            ch = get_char_keyboard_nonblock()
-            if ch != "":
-                print("Exiting ...")
-                sys.exit()
+            s.close()
+        except OSError:
+            pass
+        s = None
+    while True:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        try:
+            sock.connect((TCP_IP, TCP_PORT))
+        except OSError as msg:
+            sock.close()
+            print("Could not connect to yaAGC (" + TCP_IP + ":" + str(TCP_PORT) + "), retrying: " + str(msg))
+            # Keep the keypad drained while waiting, but ignore what is pressed.
+            deadline = time.time() + 1
+            while time.time() < deadline:
+                get_char_keyboard_nonblock()
+                time.sleep(0.05)
+            continue
+        sock.setblocking(False)
+        s = sock
+        print("Connected to yaAGC (" + TCP_IP + ":" + str(TCP_PORT) + ")")
+        resetDisplayState()
+        nextion_vn_blink(0)
+        updateLamps()
+        return
+
 connectToAGCneeded = 0
 #connectToAGC()
 
@@ -1059,8 +1041,16 @@ def eventLoop():
             # over time until it fills.	
             try:
                 numNewBytes = s.recv_into(view, leftToRead)
-            except:
+                if numNewBytes == 0:
+                    raise ConnectionResetError("yaAGC closed the connection")
+            except (BlockingIOError, InterruptedError):
                 numNewBytes = 0
+            except OSError as e:
+                print("Lost connection to yaAGC: " + str(e))
+                connectToAGC()
+                view = memoryview(inputBuffer)
+                leftToRead = packetSize
+                continue
             if numNewBytes > 0:
                 view = view[numNewBytes:]
                 leftToRead -= numNewBytes
@@ -1117,7 +1107,14 @@ def eventLoop():
                 echoOn(True)
                 return
             for i in range(0, len(externalData)):
-                packetize(externalData[i])
+                try:
+                    packetize(externalData[i])
+                except OSError as e:
+                    print("Lost connection to yaAGC while sending: " + str(e))
+                    connectToAGC()
+                    view = memoryview(inputBuffer)
+                    leftToRead = packetSize
+                    break
                 didSomething = True
                 #print (f'keypressed {keypressed} {type(keypressed)} idleclock {idleclock} {type(idleclock)}')
 
