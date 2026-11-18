@@ -545,11 +545,12 @@ def codeToString(code):
 #   V98E  arm shutdown - all lamps blink; press PRO within SHUTDOWN_WINDOW
 #         seconds to power off.  Any other key, or the timeout, cancels.
 #   V94E  return to the idle clock (as does --idle-minutes without a keypress).
+#   V88E  countdown timer (see "Countdown timer" below).
 # Sending them to the AGC would make it blank the display (it does that for
 # every extended verb) and light OPR ERR, so a V is held back until the
 # following keys show whether it starts one of these commands.  If not, the
 # held keys are passed on in order.
-LOCAL_COMMANDS = {"V98E": "shutdown", "V94E": "clock"}
+LOCAL_COMMANDS = {"V98E": "shutdown", "V94E": "clock", "V88E": "timer"}
 IDLE_TIMEOUT = args.idle_minutes * 60
 lastKeyTime = time.time()
 SHUTDOWN_WINDOW = 5.0
@@ -573,6 +574,8 @@ def handleKey(ch):
         if LOCAL_COMMANDS[candidate] == "shutdown":
             print("V98E: press PRO within %g s to shut down, any other key cancels" % SHUTDOWN_WINDOW)
             shutdownArmedUntil = time.time() + SHUTDOWN_WINDOW
+        elif LOCAL_COMMANDS[candidate] == "timer":
+            timerBegin()
         else:
             enterClockMode("V94E")
         return
@@ -617,10 +620,201 @@ def shutdownTick():
         shutdownBlink = blink
         updateLamps()
 
+###################################################################################
+# Countdown timer (local; nothing here is sent to the AGC).
+#   V88E      VERB 88 / NOUN 00 flash.  Load R1 = hours, R2 = minutes (0-59),
+#             R3 = seconds to 2 decimal places (+0SSCC, e.g. +03000 = 30.00 s),
+#             each as sign + 5 digits + ENTR, like a DSKY decimal load (same
+#             layout as N36).  The ENTR after R3 starts the countdown.  CLR
+#             re-blanks the register being loaded; RSET clears OPR ERR.
+#   running   R1 = hours, R2 = minutes, R3 = seconds.hundredths, like N36.
+#   at zero   V/N and R1-R3 flash.  The lamps first light one at a time from
+#             top to bottom (ALARM_CHASE_PASSES passes), then PROG stays on
+#             while STBY flashes, until PRO or RSET returns to the AGC display.
+#   V34E      cancels (during load or while running); V94E goes to the clock.
+# (V88 is a spare verb in Luminary099; V93 is in use.)
+TIMER_VERB = "88"
+TIMER_NOUN = "00"
+ALARM_CHASE_STEP = 0.12      # seconds each lamp is lit during the chase
+ALARM_CHASE_PASSES = 3
+# Lamps in NeoPixel order, which runs down the panel row by row.
+ALARM_CHASE_ORDER = sorted(lamps, key=lambda k: min(lamps[k]["pos"]))
+
+def timerAlarmLamp(key):
+    # Whether lamp `key` is lit at this point of the zero alarm.
+    lampState = timer["lampState"]
+    if lampState is None:
+        return False
+    if lampState in lamps:
+        return key == lampState            # chase: one lamp at a time
+    return key == "PROG" or (key == "DSKY STANDBY" and lampState == "STBY on")
+
+def timerShowRegister(reg, sign, digits):
+    nextion("R%d_1" % reg, sign)
+    for i in range(5):
+        nextion("R%d_%d" % (reg, i + 2), digits[i] if i < len(digits) else " ")
+
+def timerShowVerb(verb):
+    nextion("VERB1", verb[0] if len(verb) > 0 else " ")
+    nextion("VERB2", verb[1] if len(verb) > 1 else " ")
+
+def timerOprErr():
+    timer["oprErr"] = True
+    updateLamps()
+
+def timerBegin():
+    global timer
+    print("V88E: countdown timer - load R1 hours, R2 minutes, R3 seconds")
+    timer = {"state": "load", "reg": 1, "sign": "", "digits": "", "values": {},
+             "verb": None, "oprErr": False, "end": 0, "blinkOn": False,
+             "alarmStart": 0, "lampState": None}
+    nextion_clearscreen()
+    timerShowVerb(TIMER_VERB)
+    nextion("NOUN1", TIMER_NOUN[0])
+    nextion("NOUN2", TIMER_NOUN[1])
+    nextion_vn_blink(1)
+    updateLamps()
+
+def timerExit(reason):
+    # Back to normal DSKY mode, restoring what the AGC last displayed.
+    global timer, lastKeyTime
+    print("Countdown timer: " + reason)
+    timer = None
+    lastKeyTime = time.time()
+    nextion_vn_blink(0)
+    nextion_clearscreen()
+    agcRedraw()
+
+def timerShowRemaining(remaining):
+    cs = max(0, int(remaining * 100))
+    hours = cs // 360000
+    minutes = (cs // 6000) % 60
+    hundredths = cs % 6000
+    timerShowRegister(1, "+", "%05d" % min(hours, 99999))
+    timerShowRegister(2, "+", "%05d" % minutes)
+    timerShowRegister(3, "+", "%05d" % hundredths)
+
+def timerStartRunning(total):
+    timer["state"] = "run"
+    timer["end"] = time.monotonic() + total
+    print("Countdown timer started: %.2f s" % total)
+    nextion_vn_blink(0)
+    timerShowRemaining(total)
+
+def timerTick():
+    # Called every pass of the event loop.
+    if timer is None:
+        return
+    if timer["state"] == "run":
+        remaining = timer["end"] - time.monotonic()
+        if remaining > 0:
+            timerShowRemaining(remaining)
+            return
+        print("Countdown timer reached zero; PRO or RSET to clear")
+        timer["state"] = "alarm"
+        timer["alarmStart"] = time.monotonic()
+        timer["blinkOn"] = None
+        timer["lampState"] = None
+        nextion_vn_blink(1)
+    if timer["state"] == "alarm":
+        now = time.monotonic()
+        blinkOn = int(now * 2) % 2 == 0
+        if blinkOn != timer["blinkOn"]:
+            timer["blinkOn"] = blinkOn
+            for reg in (1, 2, 3):
+                if blinkOn:
+                    timerShowRegister(reg, "+", "00000")
+                else:
+                    timerShowRegister(reg, " ", "")
+        step = int((now - timer["alarmStart"]) / ALARM_CHASE_STEP)
+        if step < ALARM_CHASE_PASSES * len(ALARM_CHASE_ORDER):
+            lampState = ALARM_CHASE_ORDER[step % len(ALARM_CHASE_ORDER)]
+        else:
+            lampState = "STBY on" if blinkOn else "STBY off"
+        if lampState != timer["lampState"]:
+            timer["lampState"] = lampState
+            updateLamps()
+
+def timerKey(ch):
+    # Handles one keypress while the timer owns the display.
+    state = timer["state"]
+    if state == "alarm" and ch in ('R', 'P'):
+        timerExit("cleared with " + ("RSET" if ch == 'R' else "PRO"))
+        return
+    if ch == 'R':
+        timer["oprErr"] = False
+        updateLamps()
+        return
+    if state == "alarm":
+        return
+    # Verb entry (only V34E is meaningful here: terminate).
+    if ch == 'V':
+        timer["verb"] = ""
+        timerShowVerb("")
+        return
+    if timer["verb"] is not None:
+        if ch.isdigit() and len(timer["verb"]) < 2:
+            timer["verb"] += ch
+            timerShowVerb(timer["verb"])
+        elif ch == 'E':
+            verb = timer["verb"]
+            timer["verb"] = None
+            if verb == "34":
+                timerExit("terminated with V34E")
+                return
+            timerShowVerb(TIMER_VERB)
+            timerOprErr()
+        elif ch == 'C':
+            timer["verb"] = ""
+            timerShowVerb("")
+        return
+    if state != "load":
+        return
+    reg = timer["reg"]
+    if ch == 'C':
+        timer["sign"] = ""
+        timer["digits"] = ""
+    elif ch in "+-":
+        if timer["sign"] or timer["digits"]:
+            timerOprErr()
+            return
+        timer["sign"] = ch
+    elif ch.isdigit():
+        if not timer["sign"]:
+            timerOprErr()
+            return
+        if len(timer["digits"]) < 5:
+            timer["digits"] += ch
+    elif ch == 'E':
+        if timer["sign"] != "+" or len(timer["digits"]) != 5:
+            timerOprErr()
+            return
+        value = int(timer["digits"])
+        if (reg == 2 and value > 59) or (reg == 3 and value > 5999):
+            timerOprErr()
+            return
+        timer["values"][reg] = value
+        if reg < 3:
+            timer["reg"] = reg + 1
+            timer["sign"] = ""
+            timer["digits"] = ""
+            return
+        v = timer["values"]
+        total = v[1] * 3600 + v[2] * 60 + v[3] / 100.0
+        if total <= 0:
+            timerOprErr()
+            return
+        timerStartRunning(total)
+        return
+    else:
+        return
+    timerShowRegister(reg, timer["sign"], timer["digits"])
+
 def inputsForAGC():
     global shutdownArmedUntil, shutdownBlink, lastKeyTime, heldKeys
     shutdownTick()
-    if IDLE_TIMEOUT > 0 and time.time() - lastKeyTime > IDLE_TIMEOUT:
+    timerTick()
+    if IDLE_TIMEOUT > 0 and timer is None and time.time() - lastKeyTime > IDLE_TIMEOUT:
         enterClockMode("no keypress for %g min" % args.idle_minutes)
         return []
     ch = get_char_keyboard_nonblock()
@@ -645,6 +839,11 @@ def inputsForAGC():
         handleKey(ch)
     if idleclock != 2 or not sendQueue:
         return []
+    if timer is not None:
+        ch = sendQueue.popleft()
+        if ch != 'PR':
+            timerKey(ch)
+        return []
     returnValue = parseDskyKey(sendQueue.popleft())
     if len(returnValue) > 0:
             print(f'Sending to yaAGC non-Oct: {returnValue[0][1]} mask  {returnValue[0][2]} -> channel {returnValue[0][0]}')
@@ -656,8 +855,11 @@ def inputsForAGC():
 # output is still read and recorded here but not drawn.
 agcShadow = {}
 
+# Countdown timer state (see "Countdown timer" below); None when not in use.
+timer = None
+
 def agcDisplayActive():
-    return idleclock == 2
+    return idleclock == 2 and timer is None
 
 def agcNextion(field, value):
     agcShadow[field] = value
@@ -690,15 +892,16 @@ def updateLamps():
     # set the neopixels in the inicator panel dependant on the
     # lamp status values.  The strip is written once per call (auto_write is off).
     for key in lampStatuses:
-        if not agcDisplayActive():
-            for x in lamps[key]["pos"]:
-                pixels[x] = black
-        elif lampStatuses[key]["isLit"] or dskyTest or shutdownBlink:
-            for x in lamps[key]["pos"]:
-                pixels[x] = lamps[key]["col"]
+        if idleclock != 2:
+            lit = False
+        elif timer is not None:
+            lit = ((key == "OPR ERR" and timer["oprErr"]) or
+                   (timer["state"] == "alarm" and timerAlarmLamp(key)) or
+                   shutdownBlink)
         else:
-            for x in lamps[key]["pos"]:
-                pixels[x] = black
+            lit = lampStatuses[key]["isLit"] or dskyTest or shutdownBlink
+        for x in lamps[key]["pos"]:
+            pixels[x] = lamps[key]["col"] if lit else black
     pixels.show()
     return
 
@@ -1022,10 +1225,11 @@ old_millisecond = "0"
 old_millisecond2 = "0"
 
 def enterClockMode(reason):
-    global keypressed, idleclock, shutdownArmedUntil, shutdownBlink, heldKeys
+    global keypressed, idleclock, shutdownArmedUntil, shutdownBlink, heldKeys, timer
     global old_week, old_year, old_month, old_day, old_hour, old_minute, old_second
     global old_millisecond, old_millisecond2
     print("Returning to clock (" + reason + ")")
+    timer = None
     keypressed = 0
     idleclock = 1
     shutdownArmedUntil = 0

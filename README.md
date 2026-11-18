@@ -23,6 +23,14 @@ Based on Ron Burkey's piDSKY (Virtual AGC project).
 Expects Virtual AGC to be built in `~/virtualagc`. Close the VirtualAGC GUI,
 because it can take port 19797.
 
+## Countdown timer
+Key `V88E` (V88 is a spare verb in Luminary099). VERB/NOUN flash; load R1 =
+hours, R2 = minutes, R3 = seconds to 2 decimal places (`+03000` = 30.00 s),
+each as `+` and 5 digits then ENTR. The last ENTR starts the countdown, shown
+like N36. At zero the lamps chase down the panel, then PROG stays on while
+STBY flashes; PRO or RSET returns to the AGC display. `V34E` cancels and
+`V94E` goes to the clock. Handled on the Pi; nothing is sent to the AGC.
+
 ## Shutting down
 - **Keypad:** key `V98E`. All lamps blink for 5 s; press `PRO` to power off.
   Any other key, or waiting, cancels.
@@ -39,5 +47,5 @@ Unplug once the activity LED stays dark. To start again, cycle the power.
   connects to the AGC.
 - `V94E`, or 10 minutes without a keypress (`--idle-minutes`), returns to the
   clock. The AGC keeps running, and the next key restores its display.
-- `V94E` and `V98E` are handled on the Pi and never sent to the AGC. A VERB
+- `V94E`, `V98E` and `V88E` are handled on the Pi and never sent to the AGC. A VERB
   press is therefore held until the next keys show it isn't one of them.
